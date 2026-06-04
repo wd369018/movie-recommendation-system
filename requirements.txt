@@ -1,4 +1,7 @@
-streamlit
-pandas
+fastapi
+uvicorn
 numpy
-scikit-learn
+pandas
+httpx
+pydantic
+python-dotenv
