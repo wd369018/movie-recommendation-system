@@ -5,3 +5,6 @@ pandas
 httpx
 pydantic
 python-dotenv
+streamlit
+scikit-learn
+scipy
