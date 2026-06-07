@@ -2,6 +2,9 @@ import os
 import pickle
 import streamlit as st
 import pandas as pd
+import os
+
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 
 # Setup Base Paths safely for deployment
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
