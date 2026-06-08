@@ -75,3 +75,5 @@ if st.button("Recommend"):
 
         for i, movie in enumerate(recommendations, 1):
             st.success(f"{i}. {movie.title()}")
+
+            
