@@ -138,3 +138,122 @@ now returns 404. **The old key must still be rotated** at
 <https://www.themoviedb.org/settings/api> — removing it from history does not
 invalidate a key that was public. `.env` is gitignored, and `.env.example`
 documents every variable.
+
+## 🚀 Deployed Link & Deployment
+
+### GitHub Repository
+**https://github.com/wd369018/movie-recommendation-system**
+
+### Quick Deploy Options (pick one)
+
+---
+
+#### 1. **Streamlit Community Cloud** (free, 2 min setup, no Docker)
+1. Push to GitHub (done — repo above)
+2. Go to **[share.streamlit.io](https://share.streamlit.io/)** → Sign in with GitHub
+3. "New app" → Select `wd369018/movie-recommendation-system`, branch `main`, file `app.py`
+4. Advanced settings → **Secrets**:
+   ```toml
+   TMDB_API_KEY = "your_rotated_key_here"
+   TMDB_RELAY = "auto"
+   TMDB_LANG = "en-US"
+   ```
+5. Deploy → you get `https://movie-recommendation-system-<hash>.streamlit.app`
+
+> ⚠️ **Limit**: 1 GB RAM, no persistent disk (cache resets on redeploy), cold start ~30 s.
+> Good for demos.
+
+---
+
+#### 2. **Render / Railway / Fly.io** (persistent disk, stable URL, ~5 min)
+Add a `Dockerfile` to the repo root:
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8501
+ENV STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    STREAMLIT_BROWSER_GATHERUSAGESTATS=false
+CMD ["streamlit", "run", "app.py"]
+```
+
+**Render:**
+1. New → Web Service → Connect GitHub repo
+2. Build: `docker build -t app .` (auto-detected from Dockerfile)
+3. Add **Disk** → Mount path `/app` → 1 GB (for `tmdb_cache.pkl`)
+4. Env vars: `TMDB_API_KEY`, `TMDB_RELAY=auto`
+5. Deploy → `https://movie-recommendation-system.onrender.com`
+
+**Railway:**
+```bash
+railway login
+railway init
+railway add --dockerfile
+railway variables set TMDB_API_KEY=xxx TMDB_RELAY=auto
+railway up
+```
+
+**Fly.io:**
+```bash
+fly launch --dockerfile
+fly secrets set TMDB_API_KEY=xxx TMDB_RELAY=auto
+fly volumes create tmdb_cache --size 1
+fly deploy
+```
+
+---
+
+#### 3. **Your own VM / VPS** (full control, cheapest at scale)
+```bash
+# On the server (Ubuntu/Debian)
+sudo apt update && sudo apt install -y python3-venv nginx
+git clone https://github.com/wd369018/movie-recommendation-system
+cd movie-recommendation-system
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# Pre-warm cache (run once, then weekly via cron)
+TMDB_API_KEY=xxx .venv/bin/python prewarm_tmdb.py --top 100 --workers 4
+
+# systemd service (/etc/systemd/system/flixfind.service)
+[Unit]
+Description=FLIXFIND Movie Recommender
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/movie-recommendation-system
+Environment=TMDB_API_KEY=xxx
+Environment=TMDB_RELAY=auto
+ExecStart=/home/ubuntu/movie-recommendation-system/.venv/bin/streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+
+# nginx reverse proxy (port 80/443 → 8501)
+sudo certbot --nginx -d yourdomain.com
+sudo systemctl enable --now flixfind
+```
+
+---
+
+### Pre-deploy Checklist
+- [ ] **Rotate TMDB key** at <https://www.themoviedb.org/settings/api> (old one was public)
+- [ ] Add `TMDB_API_KEY` to platform secrets/env (never in code)
+- [ ] Set `TMDB_RELAY=auto` (lets the app bypass network blocks)
+- [ ] Run `prewarm_tmdb.py` locally or in CI to seed `tmdb_cache.pkl` (makes first loads instant)
+- [ ] For Render/Railway/Fly: attach a **persistent volume** at `/app` so the cache survives redeploys
+
+---
+
+### Current Status
+- ✅ Code pushed to GitHub (`main` branch, commit `9cd502f`)
+- ✅ All 110 tests passing
+- ✅ Server health check: `http://localhost:8501/_stcore/health` → 200
+- ⏳ **Live URL**: Deploy via one of the options above — takes 5–10 min
