@@ -1,49 +1,38 @@
 """Movie Recommender -- single Streamlit app (UI + TMDB integration).
 
-Netflix-style dark UI on top of a content-based recommender.
-
 Data flow:
     pick a seed movie
       -> local TF-IDF cosine similarity (offline, instant)
       -> resolve each recommendation to TMDB for artwork / trailer / watch links
 
-If TMDB is unreachable the app still works; it just falls back to text cards.
+If TMDB is unreachable the app still works; tiles fall back to a placeholder and
+the sidebar names the reason.
 """
 
 from __future__ import annotations
 
 import html
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 import netflix_theme
 import tmdb_client as tmdb
-from movies import MovieIndex, pretty_title, split_genres
+from movies import MovieIndex, split_genres
 
 st.set_page_config(
-    page_title="Netflix · Movie Recommender",
-    page_icon="🎬",
+    page_title="FLIXFIND",
+    page_icon="\U0001f3ac",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-netflix_theme.inject()
 
 TOP_N_DEFAULT = 12
-CARD_WIDTH = 178
-REGIONS = {
-    "US": "United States",
-    "GB": "United Kingdom",
-    "IN": "India",
-    "CA": "Canada",
-    "AU": "Australia",
-    "DE": "Germany",
-    "FR": "France",
-    "ES": "Spain",
-    "BR": "Brazil",
-    "JP": "Japan",
-}
+GRID_COLUMNS = 6
+PALETTE_KEYS = ("dark", "light")
+# The catalogue is a US-market TMDB dump, and the region only ever affected the
+# where-to-watch links, so it is fixed rather than exposed as a control.
+REGION = "US"
 
 
 # ----------------------------------------------------------------- data layer
@@ -52,9 +41,10 @@ def load_index() -> MovieIndex:
     return MovieIndex()
 
 
-@st.cache_resource
-def cache_store() -> tmdb.TMDBCache:
-    return tmdb.get_cache()
+class Settings(NamedTuple):
+    top_n: int
+    popularity: float
+    only_with_posters: bool
 
 
 # ------------------------------------------------------------------ utilities
@@ -63,117 +53,68 @@ def esc(text: Any) -> str:
     return html.escape(str(text if text is not None else ""))
 
 
-def card_html(card: Dict[str, Any], subtitle: str = "") -> str:
-    """One poster tile.
-
-    The tile is a real link so it works without JavaScript; the button that
-    follows opens the details dialog. Both point at the same movie.
-    """
-    title = esc(card["title"])
-    poster = card.get("poster_url")
-    if poster:
-        art = (
-            f'<img src="{esc(poster)}" alt="{title}" loading="lazy" '
-            f'title="{title}">'
+def status_pill(ok: bool, detail: str) -> str:
+    """The connection badge. The glyph is a literal character so it renders in
+    both themes rather than depending on a themed icon font."""
+    if ok:
+        return (
+            '<span class="nf-status ok">'
+            '<span class="nf-status-icon">&#10003;</span>TMDB connected</span>'
         )
-    else:
-        art = f'<div class="nf-poster-fallback">{title}</div>'
-
-    badge = ""
-    rating = card.get("vote_average")
-    if isinstance(rating, (int, float)) and rating:
-        badge = f'<div class="nf-card-badge">★ {rating:.1f}</div>'
-
-    sub = f'<div class="nf-card-sub">{esc(subtitle)}</div>' if subtitle else ""
+    label = "No API key" if not tmdb.is_configured() else "TMDB blocked"
+    title = f' title="{esc(detail)}"' if detail else ""
     return (
-        f'<div class="nf-card">{art}'
-        f'<div class="nf-card-title">{title}</div>{badge}{sub}</div>'
+        f'<span class="nf-status warn"{title}>'
+        f'<span class="nf-status-icon">&#9888;</span>{esc(label)}</span>'
     )
 
 
-def hero_html(card: Dict[str, Any], kicker: str) -> str:
-    """The full-width featured panel at the top of the page."""
-    title = esc(card["title"])
-    backdrop = card.get("backdrop_url") or card.get("poster_url")
-    art = (
-        f'<img src="{esc(backdrop)}" alt="" aria-hidden="true">'
-        if backdrop
-        else ""
+def masthead(ok: bool, detail: str) -> None:
+    st.markdown(
+        '<div class="nf-mast">'
+        '<div class="nf-brand">'
+        '<span class="nf-brand-mark"></span>FLIX<em>FIND</em>'
+        "</div>"
+        f"{status_pill(ok, detail)}"
+        "</div>"
+        '<hr class="nf-rule">',
+        unsafe_allow_html=True,
     )
 
-    pills = []
-    for genre in (card.get("genres") or [])[:4]:
-        pills.append(f'<span class="nf-pill">{esc(genre)}</span>')
-    for year, runtime, rating in (
-        (card.get("year"),
-         card.get("runtime"),
-         card.get("vote_average")),
-    ):
-        if year:
-            pills.append(f'<span class="nf-pill">{esc(year)}</span>')
-        if runtime:
-            pills.append(f'<span class="nf-pill">{esc(runtime)} min</span>')
-        if isinstance(rating, (int, float)) and rating:
-            pills.append(f'<span class="nf-pill nf-score">★ {rating:.1f}</span>')
 
-    overview = card.get("overview")
-    overview_html = (
-        f'<div class="nf-hero-overview">{esc(overview)}</div>'
-        if overview
-        else ""
+def section_head(text: str, note: str = "") -> None:
+    note_html = f'<div class="nf-head-note">{esc(note)}</div>' if note else ""
+    st.markdown(
+        '<div class="nf-head">'
+        '<span class="nf-head-bar"></span>'
+        f'<span class="nf-head-text">{esc(text)}</span>'
+        "</div>" + note_html,
+        unsafe_allow_html=True,
     )
-    tagline = card.get("tagline")
-    tagline_html = (
-        f'<div class="nf-hero-tagline">{esc(tagline)}</div>' if tagline else ""
-    )
-
-    return f"""
-    <div class="nf-hero">{art}
-      <div class="nf-hero-body">
-        <div class="nf-hero-kicker">{esc(kicker)}</div>
-        <div class="nf-hero-title">{title}</div>
-        {tagline_html}
-        <div class="nf-hero-meta">{''.join(pills)}</div>
-        {overview_html}
-      </div>
-    </div>
-    """
-
-
-def row_html(cards: List[Dict[str, Any]], subtitles: List[str]) -> str:
-    """A horizontally scrollable row of poster tiles."""
-    tiles = "".join(
-        card_html(card, subtitles[i] if i < len(subtitles) else "")
-        for i, card in enumerate(cards)
-    )
-    return f'<div class="nf-scroller"><div style="display:flex">{tiles}</div></div>'
 
 
 def meta_line(*parts: Optional[str]) -> Optional[str]:
     kept = [p for p in parts if p]
-    return "  ·  ".join(kept) if kept else None
+    return "  \u00b7  ".join(kept) if kept else None
 
 
 def local_genres(index: MovieIndex, pos: int) -> List[str]:
     return split_genres(index.get(pos, "genres"))
 
 
-def resolve_card(
-    index: MovieIndex, pos: int, region: str
-) -> Optional[Dict[str, Any]]:
-    """TMDB record for a dataset row, or None if TMDB has no match.
+def load_card(index: MovieIndex, pos: int) -> Dict[str, Any]:
+    """TMDB metadata for a dataset row, falling back to the dataset's own fields.
 
-    The dataset has no TMDB id (and no release year to disambiguate remakes), so
+    The dataset has no TMDB id (and no release year to tell remakes apart), so
     the match is by title. A miss is normal, not exceptional.
     """
     try:
-        return tmdb.resolve(index.titles[pos], region=region)
+        card = tmdb.resolve(index.titles[pos], region=REGION)
     except tmdb.TMDBUnavailable:
-        return None
+        card = None
+    if card:
+        return card
 
-
-def fallback_details(index: MovieIndex, pos: int) -> Dict[str, Any]:
-    """Dataset-only metadata, used when TMDB is unavailable."""
     overview = index.get(pos, "overview")
     if overview and str(overview) == str(index.get(pos, "tags", "")):
         overview = None  # `tags` is just overview+genres; avoid echoing it
@@ -196,107 +137,131 @@ def fallback_details(index: MovieIndex, pos: int) -> Dict[str, Any]:
     }
 
 
-def load_card(index: MovieIndex, pos: int, region: str) -> Dict[str, Any]:
-    """TMDB metadata for a row, falling back to the dataset's own fields."""
-    return resolve_card(index, pos, region) or fallback_details(index, pos)
-
-
-# --------------------------------------------------------------------- header
-def render_sidebar(tmdb_ok: bool) -> Tuple[int, float, str, bool]:
-    st.sidebar.markdown("### 🎬 FLIXFIND")
-    st.sidebar.caption(
-        "Content-based recommendations: TF-IDF vectors over plot, genre and "
-        "tagline text, ranked by cosine similarity."
+# ------------------------------------------------------------------- fragments
+def hero_html(card: Dict[str, Any], kicker: str) -> str:
+    backdrop = card.get("backdrop_url") or card.get("poster_url")
+    art = (
+        f'<img class="nf-hero-art" src="{esc(backdrop)}" alt="" aria-hidden="true">'
+        if backdrop
+        else ""
     )
+
+    pills = []
+    for genre in (card.get("genres") or [])[:4]:
+        pills.append(f'<span class="nf-pill">{esc(genre)}</span>')
+    if card.get("year"):
+        pills.append(f'<span class="nf-pill">{esc(card["year"])}</span>')
+    if card.get("runtime"):
+        pills.append(f'<span class="nf-pill">{esc(card["runtime"])} min</span>')
+    rating = card.get("vote_average")
+    if isinstance(rating, (int, float)) and rating:
+        pills.append(f'<span class="nf-pill star">&#9733; {rating:.1f}</span>')
+
+    return (
+        '<div class="nf-hero">'
+        f"{art}"
+        '<div class="nf-hero-body">'
+        f'<div class="nf-kicker">{esc(kicker)}</div>'
+        f'<div class="nf-hero-title">{esc(card["title"])}</div>'
+        + (f'<div class="nf-tagline">{esc(card["tagline"])}</div>'
+           if card.get("tagline") else "")
+        + f'<div class="nf-pills">{"".join(pills)}</div>'
+        + (f'<p class="nf-hero-overview">{esc(card["overview"])}</p>'
+           if card.get("overview") else "")
+        + "</div></div>"
+    )
+
+
+def tile_html(card: Dict[str, Any]) -> str:
+    """Poster artwork, or a placeholder when TMDB has none."""
+    poster = card.get("poster_url")
+    if poster:
+        return (
+            '<div class="nf-tile">'
+            f'<img src="{esc(poster)}" alt="{esc(card["title"])}" loading="lazy">'
+            "</div>"
+        )
+    return (
+        '<div class="nf-tile">'
+        '<div class="nf-tile-empty">&#127916;</div>'
+        "</div>"
+    )
+
+
+# ---------------------------------------------------------------------- theme
+def seed_theme() -> None:
+    """Seed the theme from the URL so a refresh keeps the choice.
+
+    Only ever *seeds*; the widget's own return value is the source of truth once
+    it exists, so this does not need to run again.
+    """
+    if "theme" not in st.session_state:
+        choice = str(st.query_params.get("theme") or "dark").strip().lower()
+        st.session_state.theme = choice if choice in PALETTE_KEYS else "dark"
+
+
+# --------------------------------------------------------------------- sidebar
+def render_sidebar() -> Tuple[Settings, str]:
+    st.sidebar.markdown("### Appearance")
+    # The widget's return value is read instead of using an `on_change`
+    # callback: a callback fires before the widget has been re-registered, so
+    # reading its key raises KeyError after a hot reload. A plain return value
+    # carries no such ordering hazard.
+    choice = st.sidebar.segmented_control(
+        "Theme",
+        options=["Dark", "Light"],
+        key="theme_pick",
+        label_visibility="collapsed",
+    )
+    theme = (choice or "Dark").strip().lower()
+    if theme not in PALETTE_KEYS:
+        theme = "dark"
+    # Keep the URL in step so a refresh restores the same look.
+    st.query_params["theme"] = theme
+    st.session_state.theme = theme
 
     st.sidebar.divider()
-    st.sidebar.markdown("#### ⚙️ Settings")
-    top_n = st.sidebar.slider(
-        "Recommendations", min_value=5, max_value=24, value=TOP_N_DEFAULT, step=1
-    )
+    st.sidebar.markdown("### Results")
+    top_n = st.sidebar.slider("How many", 5, 24, TOP_N_DEFAULT, 1)
     popularity = st.sidebar.slider(
-        "Popularity blend", min_value=0.0, max_value=1.0, value=0.35, step=0.05,
-        help=(
-            "0 = pure text similarity. Higher values favour well-known films. "
-            "Text similarity alone often surfaces obscure titles whose short "
-            "blurb happens to share common words."
-        ),
+        "Popularity blend", 0.0, 1.0, 0.35, 0.05,
+        help="0 = pure text match. Raise it to favour well-known films.",
     )
-    region_label = st.sidebar.selectbox(
-        "Streaming region", list(REGIONS.values()), index=0
-    )
-    region = next(k for k, v in REGIONS.items() if v == region_label)
-    only_with_posters = st.sidebar.checkbox(
-        "Hide titles without artwork", value=False,
-        help="Useful when many matches are missing from TMDB.",
-    )
+    only_with_posters = st.sidebar.checkbox("Only titles with artwork", False)
 
-    st.sidebar.divider()
-    st.sidebar.markdown("#### 🌐 TMDB artwork")
-    if not tmdb.is_configured():
-        st.sidebar.error("`TMDB_API_KEY` is missing from `.env`")
-    elif not tmdb_ok:
-        st.sidebar.warning("TMDB unreachable — showing text-only results.")
-        st.sidebar.caption(
-            "`api.themoviedb.org` failed its TLS handshake on this machine. A VPN "
-            "or another network usually fixes it; the app keeps working without it."
-        )
-    else:
-        st.sidebar.success("Connected to TMDB")
-
-    stats = cache_store().stats()
-    st.sidebar.caption(
-        f"Cached lookups: **{stats['total']}** ({stats['fresh']} fresh)"
-    )
-    with st.sidebar.expander("Cache tools"):
-        st.caption(
-            "Lookups are cached to `tmdb_cache.pkl` for 30 days, so posters and "
-            "watch links survive restarts and network outages."
-        )
-        if st.button("Save cache to disk", width="stretch"):
-            cache_store().flush()
-            st.success("Saved.")
-        if st.button("Clear cache", width="stretch"):
-            cache_store().clear()
-            st.rerun()
-    return top_n, popularity, region, only_with_posters
+    return Settings(top_n, popularity, only_with_posters), theme
 
 
 # ---------------------------------------------------------------- search panel
 def render_search(index: MovieIndex) -> Optional[int]:
-    st.markdown(
-        f'<div class="nf-row-title" style="font-size:1.6rem;margin-top:.6rem">'
-        f"Find something you like</div>"
-        f'<div class="nf-row-sub" style="margin-bottom:1rem">'
-        f"Search {len(index):,} films, then pick the one whose row you want to see."
-        f"</div>",
-        unsafe_allow_html=True,
-    )
+    """Type a title, press Recommend.
 
-    query = st.text_input(
-        "Movie title", placeholder="🔍  e.g. Inception, Toy Story, The Avengers",
-        label_visibility="collapsed",
-    )
+    A form keeps the app from re-ranking on every keystroke, which on 45,447
+    titles was both slow and made the results flicker as you typed.
+    """
+    with st.container(key="nf-recommend"):
+        with st.form("search", clear_on_submit=False, border=False):
+            query = st.text_input(
+                "Movie name",
+                placeholder="Type a movie name\u2026",
+                label_visibility="collapsed",
+            ).strip()
+            pressed = st.form_submit_button("Recommend", type="primary")
 
-    if not query.strip():
-        st.markdown(
-            '<div class="nf-row-sub" style="margin:.6rem 0 0 0">'
-            "Tip: start typing — results appear as you go.</div>",
-            unsafe_allow_html=True,
-        )
-        with st.expander("Or browse the full catalogue"):
-            choice = st.selectbox(
-                "All movies", index._search_space,  # noqa: SLF001 - same package
-                format_func=pretty_title, index=None,
-                placeholder=f"Choose from {len(index):,} movies...",
-            )
-            if choice:
-                return index.seed_by_title[choice]
+    # Forms batch their widgets, so a sidebar change re-runs with `pressed`
+    # False but the text box still holding the last value. Remembering the
+    # submitted query is what keeps results on screen through those re-runs.
+    if pressed and query:
+        st.session_state["last_query"] = query
+    submitted = st.session_state.get("last_query", "")
+
+    if not submitted:
+        st.caption("Enter any movie name and press Recommend.")
         return None
 
-    matches = index.search(query)
+    matches = index.search(submitted)
     if not matches:
-        st.warning(f"No movie in the catalogue matches **{query}**.")
+        st.warning(f"No movie in the catalogue matches **{submitted}**.")
         return None
     if len(matches) == 1:
         return matches[0]
@@ -306,168 +271,154 @@ def render_search(index: MovieIndex) -> Optional[int]:
     labels: Dict[int, str] = {}
     for pos in matches:
         count = len(index.variants(index.titles[pos]))
-        suffix = f"  ({count} versions)" if count > 1 else ""
-        labels[pos] = f"{index.display_title(pos)}{suffix}"
+        labels[pos] = index.display_title(pos) + (f"  ({count} versions)"
+                                                  if count > 1 else "")
 
-    st.markdown(f"**{len(matches)} matches** — pick one:")
+    st.caption(f"{len(matches)} matches \u2014 pick one:")
     # `dict.get` rather than `list.index`: format_func must be total, or a rerun
     # carrying a stale widget value raises.
     return st.radio(
-        "Matches", options=matches, format_func=labels.get,
-        index=0, label_visibility="collapsed",
+        "Matches",
+        options=matches,
+        format_func=labels.get,
+        index=0,
+        label_visibility="collapsed",
     )
 
 
-# ------------------------------------------------------------- hero + results
-def render_hero(index: MovieIndex, seed: int, region: str) -> None:
-    card = load_card(index, seed, region)
-    st.markdown(hero_html(card, "Your pick"), unsafe_allow_html=True)
+# ----------------------------------------------------------------- result grid
+class _Row(NamedTuple):
+    """Minimal shape so the variants row can reuse the grid renderer."""
 
-    # Trailer / details live below the hero so the page still works when the
-    # artwork is missing.
-    if card.get("trailer") and card["trailer"].get("key"):
-        with st.expander("▶️  Watch trailer"):
-            _embed_trailer(card["trailer"])
+    row: int
+    text_score: Optional[float] = None
 
 
-def _embed_trailer(trailer: Dict[str, str]) -> None:
-    components.html(
-        f"""
-        <iframe width="100%" height="380" style="border:0;border-radius:8px"
-                src="https://www.youtube.com/embed/{esc(trailer['key'])}"
-                title="{esc(trailer.get('name', 'Trailer'))}"
-                allow="accelerometer; autoplay; encrypted-media; gyroscope;
-                       picture-in-picture" allowfullscreen></iframe>
-        """,
-        height=400,
-    )
-
-
-def render_row(
+def render_grid(
     index: MovieIndex,
     recs: List[Any],
-    region: str,
     only_with_posters: bool,
+    key: str,
 ) -> None:
-    """A single scrollable row of poster tiles with a details button under each."""
-    cards: List[Dict[str, Any]] = []
-    subtitles: List[str] = []
-    buttons: List[int] = []
-    best = max((r.rank_score for r in recs), default=1.0) or 1.0
-
+    """Poster grid. Each tile's title is the button, so there is no second row
+    of controls to keep aligned with the artwork."""
+    tiles: List[tuple] = []
     for rec in recs:
-        card = load_card(index, rec.row, region)
+        card = load_card(index, rec.row)
         if only_with_posters and not card.get("poster_url"):
             continue
-        cards.append(card)
-        # Show the raw cosine similarity; the bar is the blended rank score.
-        subtitles.append(f"{rec.text_score:.0%} match")
-        buttons.append(rec.row)
+        bits: List[str] = []
+        rating = card.get("vote_average")
+        if isinstance(rating, (int, float)) and rating:
+            bits.append(f"\u2605 {rating:.1f}")
+        # The variants row carries no similarity score, so omit the hint
+        # rather than claim a match it never computed.
+        if rec.text_score is not None:
+            bits.append(f"{rec.text_score:.0%} text match")
+        tiles.append((card, rec.row, "  \u00b7  ".join(bits)))
 
-    if not cards:
-        st.info("No titles with artwork. Turn off *Hide titles without artwork*.")
+    if not tiles:
+        st.info("No titles with artwork. Turn off *Only titles with artwork*.")
         return
 
-    st.markdown(row_html(cards, subtitles), unsafe_allow_html=True)
+    # The `key` gives the container a `st-key-nf-tiles-*` class, which is how the
+    # stylesheet recognises the tile buttons.
+    with st.container(key=f"nf-tiles-{key}"):
+        for start in range(0, len(tiles), GRID_COLUMNS):
+            for column, (card, row, hint) in zip(
+                st.columns(GRID_COLUMNS, gap="small"),
+                tiles[start:start + GRID_COLUMNS],
+            ):
+                with column:
+                    st.markdown(tile_html(card), unsafe_allow_html=True)
+                    if st.button(
+                        card["title"],
+                        key=f"{key}-t{row}",
+                        width="stretch",
+                        help=hint,
+                    ):
+                        st.session_state["open_details"] = (row, None)
 
-    # Real buttons beneath the row: the tiles are images, so each needs its own
-    # control to open the details dialog.
-    columns = st.columns(len(buttons), gap="small")
-    for column, pos in zip(columns, buttons):
-        with column:
-            if st.button("Details", key=f"details_{pos}", width="stretch"):
-                rec = next(r for r in recs if r.row == pos)
-                st.session_state["open_details"] = (pos, rec.text_score)
+
+def render_hero(index: MovieIndex, seed: int) -> None:
+    card = load_card(index, seed)
+    st.markdown(hero_html(card, "Your pick"), unsafe_allow_html=True)
+    if card.get("trailer") and card["trailer"].get("key"):
+        with st.expander("Watch trailer"):
+            embed_trailer(card["trailer"])
 
 
-def render_recommendations(
-    index: MovieIndex,
-    seed: int,
-    top_n: int,
-    popularity: float,
-    region: str,
-    only_with_posters: bool,
-) -> None:
+def embed_trailer(trailer: Dict[str, str]) -> None:
+    # `st.components.v1.html` is deprecated and slated for removal; `st.html` is
+    # the replacement. It has no `height` argument, so the frame sizes itself
+    # from an aspect ratio -- which also means it shrinks correctly on a phone
+    # instead of forcing a 380px-tall letterbox onto a 375px-wide screen.
+    st.html(
+        '<iframe class="nf-embed" '
+        'src="https://www.youtube.com/embed/' + esc(trailer["key"]) + '" '
+        'title="' + esc(trailer.get("name", "Trailer")) + '" '
+        'allow="accelerometer; autoplay; encrypted-media; gyroscope; '
+        'picture-in-picture" allowfullscreen></iframe>',
+        width="stretch",
+    )
+
+
+def render_recommendations(index: MovieIndex, seed: int, s: Settings) -> None:
     with st.spinner("Ranking 45,447 movies by cosine similarity..."):
-        scored = index.recommend(seed, top_n=top_n, popularity_weight=popularity)
-
+        scored = index.recommend(
+            seed, top_n=s.top_n, popularity_weight=s.popularity
+        )
     if not scored:
         st.info(
-            "Nothing scored above zero against this title — its text features "
-            "look empty. Try a better-known movie."
+            "Nothing scored above zero against this title \u2014 its text "
+            "features look empty. Try a better-known movie."
         )
         return
 
-    st.markdown(
-        f'<div class="nf-row-title">Because you picked '
-        f"{esc(index.display_title(seed))}</div>"
-        f'<div class="nf-row-sub">Each film below overlaps most with your pick '
-        f"on plot, genre and tagline text. Scroll sideways for more.</div>",
-        unsafe_allow_html=True,
+    section_head(
+        f"Because you picked {index.display_title(seed)}",
+        "Closest matches on plot, genre and tagline text.",
     )
-    render_row(index, scored, region, only_with_posters)
+    render_grid(index, scored, s.only_with_posters, key="recs")
 
 
-def render_similar_to_picks(
-    index: MovieIndex, seed: int, region: str, only_with_posters: bool
-) -> None:
-    """A second row: the dataset's other versions of the same title.
-
-    Surfaces remakes and re-releases, which the TF-IDF ranking tends to bury.
-    """
+def render_variants(index: MovieIndex, seed: int, s: Settings) -> None:
+    """The dataset's other versions of the same title -- remakes and
+    re-releases, which the TF-IDF ranking tends to bury."""
     others = [p for p in index.variants(index.titles[seed]) if p != seed]
     if not others:
         return
-
-    st.markdown(
-        '<div class="nf-row-title">More like this title</div>'
-        f'<div class="nf-row-sub">Other versions of '
-        f"{esc(index.display_title(seed))} in the catalogue.</div>",
-        unsafe_allow_html=True,
+    section_head(
+        "Other versions of this title",
+        f"Also in the catalogue as \u201c{index.display_title(seed)}\u201d.",
     )
-
-    class _Row:  # reuse render_row's shape without re-running the ranker
-        def __init__(self, row: int):
-            self.row = row
-            self.text_score = 1.0
-            self.rank_score = 1.0
-
-    render_row(index, [_Row(p) for p in others], region, only_with_posters)
+    render_grid(
+        index, [_Row(p) for p in others], s.only_with_posters, key="variants",
+    )
 
 
 # ------------------------------------------------------------------ detail view
 @st.dialog("Movie details", width="large")
 def details_dialog(
-    index: MovieIndex, pos: int, region: str, text_score: Optional[float] = None
+    index: MovieIndex, pos: int, text_score: Optional[float]
 ) -> None:
-    card = load_card(index, pos, region)
-    if card.get("tmdb_id") is None and not card.get("poster_url"):
-        st.caption(
-            f"TMDB has no match for *{index.display_title(pos)}* — showing "
-            "catalogue metadata."
-        )
-
+    card = load_card(index, pos)
     st.markdown(f"## {esc(card['title'])}")
     if card.get("tagline"):
-        st.markdown(f"*{esc(card['tagline'])}*")
-
-    if text_score is not None:
-        st.caption(
-            f"Text similarity to your pick: **{text_score:.1%}** "
-            "(cosine similarity of TF-IDF vectors)"
-        )
+        st.caption(f"*{esc(card['tagline'])}*")
 
     line = meta_line(
         str(card["year"]) if card.get("year") else None,
         f"{card['runtime']} min" if card.get("runtime") else None,
-        f"★ {card['vote_average']:.1f}"
+        f"\u2605 {card['vote_average']:.1f}"
         if isinstance(card.get("vote_average"), (int, float)) else None,
-        f"({card['vote_count']:,} votes)" if card.get("vote_count") else None,
+        f"{card['vote_count']:,} votes" if card.get("vote_count") else None,
+        f"{text_score:.1%} text match" if text_score is not None else None,
     )
     if line:
         st.caption(line)
     if card.get("genres"):
-        st.caption(" · ".join(card["genres"]))
+        st.caption(" \u00b7 ".join(card["genres"]))
 
     if card.get("backdrop_url"):
         st.image(card["backdrop_url"], width="stretch")
@@ -475,38 +426,30 @@ def details_dialog(
         st.write(card["overview"])
 
     if card.get("trailer") and card["trailer"].get("key"):
-        st.markdown("#### ▶️ Trailer")
-        _embed_trailer(card["trailer"])
+        st.markdown("#### Trailer")
+        embed_trailer(card["trailer"])
         st.caption(
-            "Trailers stream from YouTube. Full films are not playable here — "
+            "Trailers stream from YouTube. Full films are not playable here \u2014 "
             "commercial services block embedding."
         )
 
+    st.markdown("#### Where to watch")
     providers = card.get("providers") or []
     if providers:
-        st.markdown(f"#### 📺 Where to watch ({REGIONS.get(region, region)})")
-        st.caption(
-            "Provider links from TMDB (JustWatch data). They open the service's "
-            "own watch page — a subscription may be required."
-        )
-        for start in range(0, len(providers), 4):
-            chunk = providers[start:start + 4]
-            for column, entry in zip(st.columns(4, gap="small"), chunk):
+        st.caption("From TMDB (JustWatch data). A subscription may be required.")
+        for start in range(0, len(providers), 2):
+            for column, entry in zip(
+                st.columns(2, gap="small"), providers[start:start + 2]
+            ):
+                href = entry.get("link")
+                label = f"{entry['name']} \u00b7 {entry['offer']}"
                 with column:
-                    if entry.get("logo_url"):
-                        st.image(entry["logo_url"], width=64)
-                    if entry.get("link"):
-                        st.link_button(
-                            f"{entry['name']} · {entry['offer']}",
-                            entry["link"], width="stretch",
-                        )
+                    if href:
+                        st.link_button(label, href, width="stretch")
                     else:
-                        st.caption(f"{entry['name']} · {entry['offer']}")
+                        st.button(label, width="stretch", disabled=True)
     else:
-        st.caption(
-            "No streaming providers listed for this title in "
-            f"{REGIONS.get(region, region)}."
-        )
+        st.caption("No streaming providers listed for this title here.")
 
     links = []
     if card.get("imdb_id"):
@@ -517,10 +460,10 @@ def details_dialog(
         )
     if card.get("homepage"):
         links.append(("Official site", card["homepage"]))
-    if links:  # st.columns(0) raises, and there may be nothing to link to
-        for column, (label, href) in zip(st.columns(len(links)), links):
-            with column:
-                st.link_button(label, href, width="stretch")
+    # st.columns(0) raises, and there may be nothing to link to
+    for column, (label, href) in zip(st.columns(len(links)) if links else [], links):
+        with column:
+            st.link_button(label, href, width="stretch")
 
     if st.button("Close", width="stretch"):
         st.rerun()
@@ -530,39 +473,34 @@ def details_dialog(
 def main() -> None:
     try:
         index = load_index()
-    except Exception as exc:  # noqa: BLE001 - surface any asset problem in the UI
+    except Exception as exc:  # noqa: BLE001 - surface asset problems in the UI
         st.error(f"Could not load the recommendation assets: {exc}")
         st.info("Expected `df.pkl` and `tfidf_matrix.pkl` next to `app.py`.")
         st.stop()
 
-    tmdb_ok, _ = tmdb.probe()
-    top_n, popularity, region, only_with_posters = render_sidebar(tmdb_ok)
+    seed_theme()
 
-    st.markdown(
-        '<div style="font-size:2.1rem;font-weight:800;letter-spacing:-.02em;'
-        'margin:.2rem 0 .1rem 0">FLIXFIND</div>'
-        '<div class="nf-row-sub" style="margin:0 0 1.2rem 0">'
-        "Pick a film. Get the most similar ones — with posters, trailers and "
-        "where-to-watch links.</div>",
-        unsafe_allow_html=True,
-    )
+    tmdb_ok, detail = tmdb.probe()
+    # The sidebar is read first because the theme toggle lives there, and the
+    # stylesheet is injected afterwards. CSS applies document-wide, so injecting
+    # it later in the run still styles the widgets rendered above it.
+    settings, theme = render_sidebar()
+    netflix_theme.inject(theme)
 
+    masthead(tmdb_ok, detail)
     seed = render_search(index)
+
     if seed is None:
-        st.markdown("---")
-        st.caption(
-            f"{len(index):,} films loaded and ready. "
-            f"{'TMDB connected.' if tmdb_ok else 'Running in offline mode.'}"
-        )
+        st.caption(f"{len(index):,} films loaded and ready.")
         return
 
-    render_hero(index, seed, region)
-    render_recommendations(index, seed, top_n, popularity, region, only_with_posters)
-    render_similar_to_picks(index, seed, region, only_with_posters)
+    render_hero(index, seed)
+    render_recommendations(index, seed, settings)
+    render_variants(index, seed, settings)
 
     opened = st.session_state.pop("open_details", None)
     if opened is not None:
-        details_dialog(index, opened[0], region, opened[1])
+        details_dialog(index, opened[0], opened[1])
 
 
 if __name__ == "__main__":

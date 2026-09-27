@@ -10,6 +10,7 @@ cache, and `https://image.tmdb.org/t/p/w500/<poster_path>` is public.
 
 from __future__ import annotations
 
+import json
 import os
 import pickle
 import time
@@ -36,6 +37,99 @@ TIMEOUT_SECONDS = 12.0
 # proxies and antivirus suites). It disables certificate verification, so keep it
 # local-only and off on any shared deployment.
 INSECURE_SSL = (os.getenv("TMDB_INSECURE_SSL") or "").lower() in {"1", "true", "yes"}
+
+# Preferred alternative to the above: point this at a .pem/.crt holding the
+# intercepting proxy's CA and verification stays ON. Sophos SSL VPN, for example,
+# re-signs traffic with "Sophos SSL CA_*", which no public CA bundle contains --
+# export that one certificate and set this, and the app connects normally.
+CA_BUNDLE = (os.getenv("TMDB_CA_BUNDLE") or "").strip()
+
+# ---------------------------------------------------------------------------
+# Working around a network that blocks TMDB outright.
+#
+# Some networks (corporate gateways, some ISPs) refuse TLS to specific hosts
+# instead of intercepting it, and no local setting can fix that. Two public
+# services can route around it:
+#
+#   * RELAYS fetch the API response from a third-party host, so the request
+#     never leaves through the blocked route.
+#   * IMAGE_PROXY_TEMPLATE does the same for image.tmdb.org, which these
+#     networks almost always block on exactly the same rule.
+#
+# Consequence: the relay operator can see your API key, because it travels in
+# the URL. Acceptable for a local project, not for a shared or public
+# deployment. Set TMDB_RELAY=off to refuse it, and rotate the key at
+# https://www.themoviedb.org/settings/api if you do use it.
+IMAGE_PROXY_TEMPLATE = "https://images.weserv.nl/?url={target}"
+RELAY_MODE = (os.getenv("TMDB_RELAY") or "auto").strip().lower()  # auto|off|only
+RELAY_TIMEOUT = 30.0
+
+
+def _unwrap_jina(outer: Dict[str, Any]) -> Dict[str, Any]:
+    """r.jina.ai returns {"data": {"content": "<body as a string>", ...}}."""
+    data = outer.get("data")
+    if isinstance(data, dict) and "content" in data:
+        return _loads(data["content"])
+    raise TMDBUnavailable("Relay response had no `data.content`.")
+
+
+def _unwrap_allorigins(outer: Dict[str, Any]) -> Dict[str, Any]:
+    """api.allorigins.win wraps the upstream body as {"contents": "<json>"}."""
+    contents = outer.get("contents")
+    if isinstance(contents, str):
+        return _loads(contents)
+    if isinstance(outer, dict) and "status_code" in outer:
+        return outer  # some relays hand back a parsed object
+    raise TMDBUnavailable("Relay response had no `contents` field.")
+
+
+def _loads(text: str) -> Dict[str, Any]:
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        raise TMDBUnavailable("Relay returned a non-JSON body.") from exc
+    if not isinstance(payload, dict):
+        raise TMDBUnavailable("Relay returned an unexpected payload shape.")
+    return payload
+
+
+# Ordered by measured reliability (jina answered 10/10 at ~0.55s; allorigins
+# was returning Cloudflare 52x most of the time). Free public services
+# rate-limit hard, so each is tried in turn before giving up.
+#
+# `quoted` records whether the target has to be percent-encoded before being
+# pasted into the URL -- relays that take a `?url=` parameter do, ones that take
+# the path directly do not.
+RELAYS: Tuple[Tuple[str, str, bool, Any], ...] = (
+    ("jina", "https://r.jina.ai/{target}", False, _unwrap_jina),
+    ("allorigins", "https://api.allorigins.win/get?url={target}", True,
+     _unwrap_allorigins),
+)
+
+# Tri-state, resolved lazily then memoised:
+#   None  -> not determined yet; True -> only a relay reaches TMDB
+_via_relay: Optional[bool] = None
+#   None  -> unknown; True -> the direct image host is blocked
+_via_image_proxy: Optional[bool] = None
+
+# TLS interceptors we can name, so the UI can say *who* is blocking rather than
+# just "connection failed".
+_KNOWN_INTERCEPTORS = (
+    ("sophos", "Sophos SSL VPN"),
+    ("zscaler", "Zscaler"),
+    ("bluecoat", "Blue Coat / Symantec"),
+    ("paloalto", "Palo Alto"),
+    ("fortinet", "Fortinet"),
+    ("cisco", "Cisco"),
+    ("kaspersky", "Kaspersky"),
+    ("netskope", "Netskope"),
+    ("mcafee", "McAfee"),
+    ("symantec", "Symantec"),
+    ("avast", "Avast"),
+    ("kaspersky", "Kaspersky"),
+    ("comodo", "Comodo"),
+    ("digicert", "DigiCert"),
+)
 
 _NO_POSTER_PLACEHOLDER = "https://image.tmdb.org/t/p/w500"
 
@@ -133,26 +227,190 @@ def get_cache() -> TMDBCache:
     return _cache
 
 
-def _client() -> httpx.Client:
+def _peer_issuer(host: str = "api.themoviedb.org") -> Optional[str]:
+    """PEM of the certificate `host` presents, or None if we can't read one.
+
+    Read with verification switched off -- this is a diagnostic, not a request,
+    and no API key is sent.
+    """
+    import socket
+    import ssl as _ssl
+    import time as _time
+
+    # Intercepting proxies often reset the *second* connection in quick
+    # succession, so a single failed read is not proof of anything -- retry once.
+    for attempt in range(2):
+        try:
+            ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            with socket.create_connection((host, 443), timeout=6) as sock:
+                with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                    der = tls.getpeercert(binary_form=True)
+            if der:
+                return _ssl.DER_cert_to_PEM_cert(der)
+        except Exception:  # noqa: BLE001 - a diagnostic must never raise
+            pass
+        if attempt == 0:
+            _time.sleep(1.0)
+    return None
+
+
+def _name_interceptor(issuer_pem: Optional[str]) -> Optional[str]:
+    """Map a presented certificate to a product name, when we recognise it."""
+    if not issuer_pem:
+        return None
+    # The PEM body carries the issuer's own O=/CN= values, which is where the
+    # vendor name lives.
+    import base64
+    import re
+
+    body = "".join(
+        line for line in issuer_pem.splitlines()
+        if not line.startswith("-----")
+    )
+    try:
+        der = base64.b64decode(body)
+    except Exception:  # noqa: BLE001
+        return None
+    text = "".join(chr(b) if 32 <= b < 127 else " " for b in der).lower()
+    for needle, label in _KNOWN_INTERCEPTORS:
+        if needle in text:
+            return label
+    return None
+
+
+def _tls_hint() -> str:
+    """A short, actionable explanation for a failed TLS handshake."""
+    if CA_BUNDLE:
+        return (
+            f"Still failing with `TMDB_CA_BUNDLE={CA_BUNDLE}` -- check the file "
+            "holds the right CA certificate."
+        )
+    issuer = _peer_issuer()
+    named = _name_interceptor(issuer)
+    if named:
+        return (
+            f"Outbound HTTPS is being intercepted by {named}, whose CA this "
+            "machine does not trust. Exclude `api.themoviedb.org` and "
+            "`image.tmdb.org` from the proxy, or set `TMDB_CA_BUNDLE` in `.env` "
+            "to that CA's certificate."
+        )
+    return (
+        "TLS handshake failed and no intercepting certificate was recognised. "
+        "A VPN, corporate proxy or antivirus is likely rewriting HTTPS; exclude "
+        "`api.themoviedb.org` from it, or set `TMDB_CA_BUNDLE` in `.env`."
+    )
+
+
+def _verify_setting() -> Any:
+    if CA_BUNDLE:
+        return CA_BUNDLE
+    return not INSECURE_SSL
+
+
+def _client(timeout: float = TIMEOUT_SECONDS) -> httpx.Client:
     return httpx.Client(
-        timeout=TIMEOUT_SECONDS,
+        timeout=timeout,
         follow_redirects=True,
-        verify=not INSECURE_SSL,
+        verify=_verify_setting(),
         headers={"Accept": "application/json"},
     )
 
 
+def _query_string(params: Dict[str, Any]) -> str:
+    from urllib.parse import urlencode
+
+    return urlencode({"api_key": TMDB_API_KEY, "language": TMDB_LANG, **params})
+
+
+def _relay_request(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Fetch an API response through a public relay, trying each in turn.
+
+    Raises the last failure so the caller can report something specific.
+    """
+    from urllib.parse import quote
+
+    target = f"{TMDB_BASE}{path}?{_query_string(params)}"
+    last = "no relay configured"
+
+    for name, template, quoted, unwrap in RELAYS:
+        url = template.format(target=quote(target, safe="") if quoted else target)
+        try:
+            with _client(RELAY_TIMEOUT) as client:
+                response = client.get(url)
+            if response.status_code != 200:
+                last = f"{name} returned HTTP {response.status_code}"
+                continue
+            try:
+                outer = response.json()
+            except ValueError:
+                last = f"{name} did not return JSON"
+                continue
+            if not isinstance(outer, dict):
+                last = f"{name} returned an unexpected shape"
+                continue
+            return unwrap(outer)
+        except TMDBUnavailable as exc:
+            last = f"{name}: {exc}"
+        except httpx.RequestError as exc:
+            last = f"{name} unreachable ({type(exc).__name__})"
+
+    raise TMDBUnavailable(f"all relays failed -- {last}")
+
+
+def _relay_hint() -> str:
+    if RELAY_MODE == "off":
+        return (
+            "Set `TMDB_RELAY=auto` in `.env` to let requests go through a public "
+            "relay, or exclude `api.themoviedb.org` from the network's block list."
+        )
+    return (
+        "Set `TMDB_CA_BUNDLE` in `.env`, or ask IT to exclude `api.themoviedb.org` "
+        "and `image.tmdb.org` from the proxy."
+    )
+
+
 def _request(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    global _via_relay
+
     if not is_configured():
         raise TMDBUnavailable("TMDB_API_KEY is not set (check your .env file).")
-    query = {"api_key": TMDB_API_KEY, "language": TMDB_LANG, **params}
+
+    # Once we know the direct route fails, stop paying for the timeout first.
+    direct_first = _via_relay is not True and RELAY_MODE != "only"
+
+    if direct_first:
+        try:
+            with _client() as client:
+                response = client.get(f"{TMDB_BASE}{path}",
+                                      params={"api_key": TMDB_API_KEY,
+                                              "language": TMDB_LANG, **params})
+        except httpx.RequestError as exc:
+            _via_relay = True
+            if RELAY_MODE == "off":
+                raise TMDBUnavailable(
+                    f"Could not reach TMDB ({type(exc).__name__}). "
+                    f"{_tls_hint()}"
+                ) from exc
+        else:
+            _via_relay = False
+            return _finish(response)
+
+    if RELAY_MODE == "off":
+        raise TMDBUnavailable(f"TMDB is blocked on this network. {_relay_hint()}")
+
     try:
-        response = _client().get(f"{TMDB_BASE}{path}", params=query)
+        return _relay_request(path, params)
+    except TMDBUnavailable as exc:
+        raise TMDBUnavailable(f"TMDB relay failed: {exc}") from exc
     except httpx.RequestError as exc:
         raise TMDBUnavailable(
-            f"Could not reach TMDB ({type(exc).__name__}). "
-            "The host may be blocked on this network."
+            f"TMDB relay unreachable ({type(exc).__name__}). {_relay_hint()}"
         ) from exc
+
+
+def _finish(response: "httpx.Response") -> Dict[str, Any]:
     if response.status_code == 401:
         raise TMDBUnavailable("TMDB rejected the API key (401).")
     if response.status_code == 429:
@@ -162,29 +420,77 @@ def _request(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     return response.json()
 
 
+def route() -> str:
+    """Human-readable description of how we are reaching TMDB right now."""
+    if not is_configured():
+        return "no key"
+    if _via_relay is True:
+        return "relay"
+    if _via_relay is False:
+        return "direct"
+    return "unknown"
+
+
+def image_route() -> str:
+    """How poster images are being served: direct, proxy, or not yet known."""
+    if _via_image_proxy is True:
+        return "proxy"
+    if _via_image_proxy is False:
+        return "direct"
+    return "unknown"
+
+
 def probe() -> Tuple[bool, str]:
     """(reachable, message), memoized briefly so we never hammer a dead host.
 
-    The message is cached alongside the verdict: a cached failure still has to
-    explain itself, otherwise the UI shows a warning with no reason.
+    The route that worked is cached alongside the verdict, so a rerun restores
+    it instead of paying for the discovery request again. The message is cached
+    too: a cached failure still has to explain itself, otherwise the UI shows a
+    warning with no reason.
     """
+    global _via_relay
+
     cache = get_cache()
     found, value, fresh = cache.lookup("__probe__")
     if found and fresh:
-        reachable, message = value
-        return bool(reachable), str(message or "")
+        reachable, message, via = _unpack_probe(value)
+        _via_relay = via
+        return reachable, message
+
     if not is_configured():
         reason = "TMDB_API_KEY is not set. Posters are disabled."
-        cache.put("__probe__", (False, reason), force=True)
+        _remember(False, reason)
         return False, reason
+
     try:
         _request("/configuration", {})
     except TMDBUnavailable as exc:
         reason = str(exc)
-        cache.put("__probe__", (False, reason), force=True)
+        _remember(False, reason)
         return False, reason
-    cache.put("__probe__", (True, ""), force=True)
+
+    # Settle the image route now too, so the UI can report it and the first tile
+    # does not have to pay for the discovery request.
+    direct_images_blocked()
+    _remember(True, "")
     return True, ""
+
+
+def _unpack_probe(value: Any) -> Tuple[bool, str, Optional[bool]]:
+    """Read a cached probe record, tolerating the older two-field shape.
+
+    Returns (reachable, message, via_relay).
+    """
+    if not isinstance(value, (tuple, list)) or not value:
+        return False, "", None
+    reachable = bool(value[0])
+    message = str(value[1]) if len(value) > 1 and value[1] else ""
+    via = value[2] if len(value) > 2 else None
+    return reachable, message, via if isinstance(via, bool) else None
+
+
+def _remember(reachable: bool, message: str) -> None:
+    get_cache().put("__probe__", (reachable, message, _via_relay), force=True)
 
 
 def _cached(key: str, loader) -> Tuple[Any, bool]:
@@ -198,10 +504,38 @@ def _cached(key: str, loader) -> Tuple[Any, bool]:
     return value, False
 
 
+def direct_images_blocked() -> bool:
+    """Is image.tmdb.org unreachable? Memoised; costs one request the first time.
+
+    Any HTTP answer counts as reachable, including a 404 -- only a transport
+    failure means the host itself is blocked.
+    """
+    global _via_image_proxy
+    if _via_image_proxy is not None:
+        return _via_image_proxy
+    try:
+        with _client(8.0) as client:
+            # A path that will not exist, so a working host answers 404 quickly
+            # while a blocked host fails at the transport layer.
+            client.head("https://image.tmdb.org/t/p/w1/__probe__.jpg")
+        _via_image_proxy = False
+    except httpx.HTTPError:
+        _via_image_proxy = True
+    return _via_image_proxy
+
+
 def poster_url(path: Optional[str], size: str = "w500") -> Optional[str]:
+    """A poster/backdrop URL that will actually load.
+
+    Networks that block the API usually block the image CDN by the same rule, so
+    the two are detected together and routed through the same public proxy.
+    """
     if not path:
         return None
-    return f"https://image.tmdb.org/t/p/{size}{path}"
+    target = f"image.tmdb.org/t/p/{size}{path}"
+    if direct_images_blocked():
+        return IMAGE_PROXY_TEMPLATE.format(target=target)
+    return f"https://{target}"
 
 
 def _pick_trailer(videos: Dict[str, Any]) -> Optional[Dict[str, str]]:
