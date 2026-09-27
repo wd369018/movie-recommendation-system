@@ -1,3 +1,23 @@
+# Secrets -- .env is tracked in history; see README "Security".
 .env
-.venn
-__pycache__
+
+# Generated at runtime
+tmdb_cache.pkl
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venn/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

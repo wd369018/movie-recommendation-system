@@ -1,5 +1,17 @@
+"""LEGACY -- superseded by `app.py` + `tmdb_client.py`.
+
+This FastAPI service used to hold all the TMDB logic, but the Streamlit UI never
+called it, so the two halves never actually worked together. Everything here now
+lives in a single Streamlit app; keep this file only if you plan to expose the
+recommender to a non-Streamlit client. To run it:
+
+    uvicorn main:app --reload
+"""
+
+import asyncio
 import os
 import pickle
+from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
@@ -17,33 +29,61 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_500 = "https://image.tmdb.org/t/p/w500"
 
-if not TMDB_API_KEY:
-    # Don't crash import-time in production if you prefer; but for you better fail early:
-    raise RuntimeError("TMDB_API_KEY missing. Put it in .env as TMDB_API_KEY=xxxx")
-
-app = FastAPI(title="Movie Recommender API", version="3.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # for local streamlit
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DF_PATH = os.path.join(BASE_DIR, "df.pkl")
-INDICES_PATH = os.path.join(BASE_DIR, "indices.pkl")
 TFIDF_MATRIX_PATH = os.path.join(BASE_DIR, "tfidf_matrix.pkl")
-TFIDF_PATH = os.path.join(BASE_DIR, "tfidf.pkl")
 
 df: Optional[pd.DataFrame] = None
-indices_obj: Any = None
 tfidf_matrix: Any = None
-tfidf_obj: Any = None
 
 TITLE_TO_IDX: Optional[Dict[str, int]] = None
+
+
+# =========================
+# STARTUP
+# =========================
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Load the pickles once per process, then release the GIL-free IO wait."""
+    global df, tfidf_matrix, TITLE_TO_IDX
+
+    with open(DF_PATH, "rb") as f:
+        df = pickle.load(f)
+    with open(TFIDF_MATRIX_PATH, "rb") as f:
+        tfidf_matrix = pickle.load(f)
+
+    # `indices.pkl` only ever mapped titles to `range(len(df))`, so it carried no
+    # information the DataFrame does not already have. Rebuilding the map here
+    # also keeps the most popular row when a title appears more than once.
+    TITLE_TO_IDX = {}
+    ranks = (
+        pd.to_numeric(df["popularity"], errors="coerce").fillna(0.0)
+        if "popularity" in df.columns
+        else pd.Series(0.0, index=df.index)
+    )
+    for pos, title in enumerate(df["title"].astype(str)):
+        key = str(title).strip().lower()
+        current = TITLE_TO_IDX.get(key)
+        if current is None or ranks.iloc[pos] > ranks.iloc[current]:
+            TITLE_TO_IDX[key] = pos
+
+    if "title" not in df.columns:
+        raise RuntimeError("df.pkl must contain a DataFrame with a 'title' column")
+    yield
+
+
+app = FastAPI(title="Movie Recommender API", version="3.1", lifespan=lifespan)
+
+# A browser rejects `allow_origins=["*"]` together with credentials, so echo the
+# requesting origin instead. Restrict this to real frontend hosts in production.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 
 # =========================
@@ -99,11 +139,18 @@ async def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     - Network errors -> 502
     - TMDB API errors -> 502 with detail
     """
+    if not TMDB_API_KEY:
+        raise HTTPException(
+            status_code=503, detail="TMDB_API_KEY is not configured on the server."
+        )
+
     q = dict(params)
     q["api_key"] = TMDB_API_KEY
 
+    # One shared client keeps connections pooled; building one per request
+    # serialised every call behind a fresh TLS handshake.
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with _tmdb_client() as client:
             r = await client.get(f"{TMDB_BASE}{path}", params=q)
     except httpx.RequestError as e:
         raise HTTPException(
@@ -117,6 +164,15 @@ async def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     return r.json()
+
+
+@asynccontextmanager
+async def _tmdb_client():
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0),
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    ) as client:
+        yield client
 
 
 async def tmdb_cards_from_results(
@@ -174,32 +230,6 @@ async def tmdb_search_first(query: str) -> Optional[dict]:
 # =========================
 # TF-IDF Helpers
 # =========================
-def build_title_to_idx_map(indices: Any) -> Dict[str, int]:
-    """
-    indices.pkl can be:
-    - dict(title -> index)
-    - pandas Series (index=title, value=index)
-    We normalize into TITLE_TO_IDX.
-    """
-    title_to_idx: Dict[str, int] = {}
-
-    if isinstance(indices, dict):
-        for k, v in indices.items():
-            title_to_idx[_norm_title(k)] = int(v)
-        return title_to_idx
-
-    # pandas Series or similar mapping
-    try:
-        for k, v in indices.items():
-            title_to_idx[_norm_title(k)] = int(v)
-        return title_to_idx
-    except Exception:
-        # last resort: if it's a list-like etc.
-        raise RuntimeError(
-            "indices.pkl must be dict or pandas Series-like (with .items())"
-        )
-
-
 def get_local_idx_by_title(title: str) -> int:
     global TITLE_TO_IDX
     if TITLE_TO_IDX is None:
@@ -267,42 +297,18 @@ async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
 
 
 # =========================
-# STARTUP: LOAD PICKLES
-# =========================
-@app.on_event("startup")
-def load_pickles():
-    global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
-
-    # Load df
-    with open(DF_PATH, "rb") as f:
-        df = pickle.load(f)
-
-    # Load indices
-    with open(INDICES_PATH, "rb") as f:
-        indices_obj = pickle.load(f)
-
-    # Load TF-IDF matrix (usually scipy sparse)
-    with open(TFIDF_MATRIX_PATH, "rb") as f:
-        tfidf_matrix = pickle.load(f)
-
-    # Load tfidf vectorizer (optional, not used directly here)
-    with open(TFIDF_PATH, "rb") as f:
-        tfidf_obj = pickle.load(f)
-
-    # Build normalized map
-    TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
-
-    # sanity
-    if df is None or "title" not in df.columns:
-        raise RuntimeError("df.pkl must contain a DataFrame with a 'title' column")
-
-
-# =========================
 # ROUTES
 # =========================
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Report whether the dataset actually loaded, not just that the port is up."""
+    loaded = df is not None and tfidf_matrix is not None
+    return {
+        "status": "ok" if loaded else "degraded",
+        "movies": int(len(df)) if loaded else 0,
+        "tfidf_shape": list(tfidf_matrix.shape) if loaded else None,
+        "tmdb_key_present": bool(TMDB_API_KEY),
+    }
 
 
 # ---------- HOME FEED (TMDB) ----------
@@ -435,8 +441,12 @@ async def search_bundle(
         except Exception:
             recs = []
 
-    for title, score in recs:
-        card = await attach_tmdb_card_by_title(title)
+    # One poster lookup per recommendation, run concurrently. Doing this
+    # serially made a 12-result response take 12 round trips.
+    cards = await asyncio.gather(
+        *(attach_tmdb_card_by_title(title) for title, _ in recs)
+    )
+    for (title, score), card in zip(recs, cards):
         tfidf_items.append(TFIDFRecItem(title=title, score=score, tmdb=card))
 
     # 2) Genre recommendations (TMDB discover by first genre)
