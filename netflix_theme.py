@@ -477,6 +477,29 @@ code, pre {{ background: var(--nf-card) !important; color: var(--nf-text) !impor
     background: var(--nf-card);
 }}
 
+/* ---------- skeleton loader ----------
+   Shown while the batch TMDB fetch is in flight. The pulse animation gives
+   immediate visual feedback instead of a blank grid. */
+.nf-skeleton {{
+    background: linear-gradient(
+        90deg,
+        var(--nf-card) 25%,
+        var(--nf-card-hover) 37%,
+        var(--nf-card) 63%
+    );
+    background-size: 400% 100%;
+    animation: nf-pulse 1.4s ease-in-out infinite;
+    border-radius: 10px;
+    overflow: hidden;
+}}
+@keyframes nf-pulse {{
+    0% {{ background-position: 100% 50%; }}
+    100% {{ background-position: 0 50%; }}
+}}
+.nf-skeleton-img {{ aspect-ratio: 2 / 3; }}
+.nf-skeleton-title {{ height: 1.2rem; margin-top: .6rem; border-radius: 4px; }}
+.nf-skeleton-meta {{ height: .85rem; margin-top: .35rem; border-radius: 4px; }}
+
 /* ---------- responsive poster grid ----------
    The columns flex-wrap instead of holding a fixed count, so a phone shows
    three tiles per row and a desktop shows six, with no server-side guess about

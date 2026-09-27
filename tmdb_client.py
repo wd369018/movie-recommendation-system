@@ -687,3 +687,37 @@ def resolve(title: str, region: str = "US") -> Optional[Dict[str, Any]]:
     if not card:
         return None
     return movie_details(card["tmdb_id"], region=region)
+
+
+def resolve_batch(titles: List[str], region: str = "US", max_workers: int = 4) -> Dict[str, Optional[Dict[str, Any]]]:
+    """Resolve multiple titles concurrently with retry/backoff.
+
+    Returns a mapping {title: card_or_None}. Uses a thread pool so the slow
+    relay round-trips overlap. `max_workers` defaults to 4 to avoid
+    overwhelming the free relay services. Failed lookups return None instead
+    of raising, so the grid can still render partial results.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import random
+
+    results: Dict[str, Optional[Dict[str, Any]]] = {}
+
+    def _one(t: str) -> tuple[str, Optional[Dict[str, Any]]]:
+        # Small random delay to spread requests and avoid burst rate-limiting
+        time.sleep(random.uniform(0.1, 0.4))
+        for attempt in range(3):
+            try:
+                return t, resolve(t, region=region)
+            except TMDBUnavailable as exc:
+                if attempt == 2:
+                    # Last attempt failed - return None so the grid still renders
+                    return t, None
+                # Exponential backoff with jitter
+                time.sleep((2 ** attempt) + random.uniform(0, 0.5))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_one, t): t for t in titles}
+        for fut in as_completed(futures):
+            title, card = fut.result()
+            results[title] = card
+    return results
